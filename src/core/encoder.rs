@@ -38,7 +38,7 @@ impl StegoEncoder {
             return Err("No se encontraron imágenes PNG".to_string());
         }
 
-        // Calcular y mostrar capacidad de todas las imágenes
+        // Calcular capacidad de todas las imágenes
         let mut image_capacities = Vec::new();
         for path in &images {
             let img = image::open(path).map_err(|e| format!("No se pudo abrir imagen {:?}: {}", path, e))?;
@@ -54,12 +54,12 @@ impl StegoEncoder {
             .map_err(|e| format!("No se pudo crear/abrir la base de datos de índices: {}", e))?;
 
         let mut results = Vec::new();
+
+        // Mapa para llevar un seguimiento de los bytes usados en cada imagen
         let mut usado_por_imagen: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
 
-        // Contador para hacer un seguimiento de cuál imagen estamos utilizando actualmente
-        let mut current_image_index = 0;
-
         for message in messages {
+            // Preparar el mensaje con encabezado
             let encrypted = if let Some(ref password) = self.password {
                 encrypt_message(message, password)?
             } else {
@@ -78,70 +78,60 @@ impl StegoEncoder {
             let full_data = [header.as_slice(), encrypted.as_slice()].concat();
             println!("Tamaño del mensaje con ID {}: {} bytes", message_id, full_data.len());
 
-            let mut written = false;
-            let initial_image_index = current_image_index; // Guardamos el índice inicial para evitar bucle infinito
+            // Buscar la imagen con mayor espacio disponible
+            let mut best_image = None;
+            let mut best_space = 0;
 
-            // Intentamos con cada imagen, empezando por la actual y siguiendo hasta encontrar una con espacio
-            loop {
-                if current_image_index >= images.len() {
-                    // Si llegamos al final de las imágenes, volvemos al principio
-                    current_image_index = 0;
-                }
-
-                let path = &images[current_image_index];
-
-                // Calculamos la capacidad total de la imagen
-                let capacity = image_capacities[current_image_index].1;
-
-                // Obtenemos los bytes usados previamente para esta imagen
+            // Revisar cada imagen para encontrar la mejor candidata
+            for (idx, (path, capacity)) in image_capacities.iter().enumerate() {
                 let bytes_usados = usado_por_imagen.get(path).cloned().unwrap_or(0);
-                let espacio_disponible = capacity - bytes_usados;
+                let espacio_disponible = *capacity - bytes_usados;
 
-                if full_data.len() <= espacio_disponible {
-                    // Hay espacio suficiente, escribimos el mensaje
-                    let mut img_buf = image::open(path)
-                        .map_err(|e| format!("No se pudo abrir imagen {:?}: {}", path, e))?
-                        .to_rgb8();
-
-                    self.write_data_from_offset(&mut img_buf, &full_data, bytes_usados)?;
-                    img_buf.save(path).map_err(|e| format!("Error al guardar imagen: {}", e))?;
-
-                    // Actualizamos el seguimiento del espacio usado
-                    let nuevo_usado = bytes_usados + full_data.len();
-                    usado_por_imagen.insert(path.clone(), nuevo_usado);
-
-                    let espacio_restante = capacity - nuevo_usado;
-                    println!(
-                        "Mensaje con ID {} ocultado en {:?}. Espacio restante: {} bytes",
-                        message_id, path, espacio_restante
-                    );
-
-                    // Registrar en la base de datos SQLite
-                    index_db.register(
-                        message_id,
-                        path,
-                        bytes_usados,
-                        &hash
-                    ).map_err(|e| format!("Error al registrar mensaje en índice: {}", e))?;
-
-                    results.push((path.clone(), message_id));
-                    written = true;
-
-                    // No avanzamos al siguiente índice si hay espacio disponible en la imagen actual
-                    if espacio_restante < 1000 { // Umbral mínimo para considerar avanzar
-                        current_image_index += 1;
-                    }
-
-                    break;
+                // Si hay suficiente espacio y es mejor que la opción actual
+                if espacio_disponible >= full_data.len() && espacio_disponible > best_space {
+                    best_image = Some(idx);
+                    best_space = espacio_disponible;
                 }
+            }
 
-                // No hay suficiente espacio, probamos con la siguiente imagen
-                current_image_index += 1;
+            // Si encontramos una imagen adecuada
+            if let Some(idx) = best_image {
+                let path = &image_capacities[idx].0;
+                let bytes_usados = usado_por_imagen.get(path).cloned().unwrap_or(0);
 
-                // Si hemos probado todas las imágenes y volvemos al punto inicial sin éxito
-                if current_image_index % images.len() == initial_image_index % images.len() && !written {
-                    return Err(format!("No hay espacio suficiente en ninguna imagen para el mensaje con ID {}", message_id));
-                }
+                // Escribir el mensaje completo en la imagen
+                let mut img_buf = image::open(path)
+                    .map_err(|e| format!("No se pudo abrir imagen {:?}: {}", path, e))?
+                    .to_rgb8();
+
+                self.write_data_from_offset(&mut img_buf, &full_data, bytes_usados)?;
+                img_buf.save(path).map_err(|e| format!("Error al guardar imagen: {}", e))?;
+
+                // Actualizar el espacio usado
+                let nuevo_usado = bytes_usados + full_data.len();
+                usado_por_imagen.insert(path.clone(), nuevo_usado);
+
+                let espacio_restante = image_capacities[idx].1 - nuevo_usado;
+                println!(
+                    "Mensaje con ID {} ocultado en {:?}. Espacio restante: {} bytes",
+                    message_id, path, espacio_restante
+                );
+
+                // Registrar en la base de datos
+                index_db.register(
+                    message_id,
+                    path,
+                    bytes_usados,
+                    &hash
+                ).map_err(|e| format!("Error al registrar mensaje en índice: {}", e))?;
+
+                results.push((path.clone(), message_id));
+            } else {
+                // No se encontró ninguna imagen con espacio suficiente
+                return Err(format!(
+                    "No hay espacio suficiente en ninguna imagen para el mensaje con ID {}. Se necesitan {} bytes",
+                    message_id, full_data.len()
+                ));
             }
         }
 
