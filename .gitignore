@@ -27,3 +27,6 @@ openspec/
 .mcp.json
 .claude/
 opencode.jsonc
+
+.DS_Store
+examples/
