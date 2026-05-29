@@ -62,7 +62,6 @@ pub enum StegoError {
     /// Cipher (AES-GCM) error.
     #[error("cipher error: {0}")]
     Cipher(String),
-
 }
 
 /// Convenience alias for `Result<T, StegoError>`.

@@ -123,10 +123,16 @@ impl StegoDecoder {
         // Phase 1: scan headers sequentially (fast — just bit reads, no crypto)
         let mut work_items: Vec<(usize, Vec<u8>, ChunkHeader)> = Vec::new();
         loop {
-            if channel_idx + CHUNK_HEADER_SIZE * 8 > total { break; }
+            if channel_idx + CHUNK_HEADER_SIZE * 8 > total {
+                break;
+            }
             let mut reader = LsbReader::new_at(img, channel_idx);
-            let Ok(header_bytes) = reader.read_bits(CHUNK_HEADER_SIZE, 1) else { break };
-            let Ok(header) = ChunkHeader::from_bytes(&header_bytes) else { break };
+            let Ok(header_bytes) = reader.read_bits(CHUNK_HEADER_SIZE, 1) else {
+                break;
+            };
+            let Ok(header) = ChunkHeader::from_bytes(&header_bytes) else {
+                break;
+            };
 
             let bpc = header.bits_per_channel;
             let ct_len = header.payload_length as usize;
@@ -145,7 +151,9 @@ impl StegoDecoder {
             if let Ok(ct) = ciphertext {
                 work_items.push((channel_idx, ct, header));
             }
-            if channel_idx >= total { break; }
+            if channel_idx >= total {
+                break;
+            }
         }
 
         // Phase 2: decrypt all chunks in parallel (Argon2id is the bottleneck)
@@ -153,11 +161,13 @@ impl StegoDecoder {
             .into_par_iter()
             .filter_map(|(_, ciphertext, header)| {
                 let header_bytes = header.to_bytes();
-                let base_key = crate::crypto::derive_base_key(password, &header.argon2_salt).ok()?;
-                let aes_key = crate::crypto::derive_message_key(&base_key, &header.message_id).ok()?;
-                let plaintext = crate::crypto::decrypt(
-                    &aes_key, &header.aes_nonce, &ciphertext, &header_bytes,
-                ).ok()?;
+                let base_key =
+                    crate::crypto::derive_base_key(password, &header.argon2_salt).ok()?;
+                let aes_key =
+                    crate::crypto::derive_message_key(&base_key, &header.message_id).ok()?;
+                let plaintext =
+                    crate::crypto::decrypt(&aes_key, &header.aes_nonce, &ciphertext, &header_bytes)
+                        .ok()?;
                 Some(DecodedChunk {
                     message_id: header.message_id,
                     chunk_index: header.chunk_index,
@@ -355,7 +365,9 @@ mod tests {
     fn decode_many_wrong_password_returns_error() {
         let cover = vec![blank(200, 200)];
         let enc = StegoEncoder::builder().build().unwrap();
-        let stego = enc.encode_many(cover, &[b"secret" as &[u8]], b"correct").unwrap();
+        let stego = enc
+            .encode_many(cover, &[b"secret" as &[u8]], b"correct")
+            .unwrap();
         let dec = StegoDecoder::builder().build();
         let err = dec.decode_many(stego, b"wrong").unwrap_err();
         assert!(matches!(err, StegoError::AuthenticationFailed));

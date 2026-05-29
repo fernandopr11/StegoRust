@@ -77,8 +77,8 @@ pub fn scan_used_channels(img: &RgbImage) -> usize {
         };
         // Advance past header (bpc=1) + payload (bpc=header.bits_per_channel)
         let header_channels = CHUNK_HEADER_SIZE * 8;
-        let payload_channels = (header.payload_length as usize * 8)
-            .div_ceil(header.bits_per_channel as usize);
+        let payload_channels =
+            (header.payload_length as usize * 8).div_ceil(header.bits_per_channel as usize);
         channel_idx += header_channels + payload_channels;
         if channel_idx >= total {
             break;
@@ -297,7 +297,8 @@ impl StegoEncoder {
                     reserved: 0,
                 };
                 let header_bytes = header.to_bytes();
-                let ciphertext = crate::crypto::encrypt(&aes_key, &aes_nonce, message, &header_bytes)?;
+                let ciphertext =
+                    crate::crypto::encrypt(&aes_key, &aes_nonce, message, &header_bytes)?;
 
                 let mut writer = LsbWriter::new_at(img.clone(), start_channel);
                 writer.write_bits(&header_bytes, 1)?;

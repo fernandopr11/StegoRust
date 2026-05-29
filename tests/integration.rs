@@ -125,12 +125,8 @@ fn t06_salt_and_nonce_unique_per_encode() {
     let msg = b"same message";
     let pw = b"same password";
 
-    let stego1 = encoder(1)
-        .encode(vec![blank(100, 100)], msg, pw)
-        .unwrap();
-    let stego2 = encoder(1)
-        .encode(vec![blank(100, 100)], msg, pw)
-        .unwrap();
+    let stego1 = encoder(1).encode(vec![blank(100, 100)], msg, pw).unwrap();
+    let stego2 = encoder(1).encode(vec![blank(100, 100)], msg, pw).unwrap();
 
     // Extract headers from both images
     let read_header = |img: &RgbImage| {
@@ -344,7 +340,9 @@ fn t15_spanning_3_chunks_across_3_images() {
     let headers: Vec<ChunkHeader> = stego.iter().map(read_header).collect();
 
     // All share the same message_id
-    assert!(headers.windows(2).all(|w| w[0].message_id == w[1].message_id));
+    assert!(headers
+        .windows(2)
+        .all(|w| w[0].message_id == w[1].message_id));
     // total_chunks = 3 in all headers
     assert!(headers.iter().all(|h| h.total_chunks == 3));
     // chunk indices are {0, 1, 2}
