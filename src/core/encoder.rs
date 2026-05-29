@@ -1,189 +1,263 @@
-use image::{DynamicImage, GenericImageView, ImageBuffer, RgbImage};
-use log::info;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-use rand::{random, Rng};
-use crate::crypto::crypto::{encrypt_message, hash_message};
-use crate::formats::header::StegoHeader;
-use crate::utils::index_db::MessageIndexDB;
-use std::fs::File;
-use std::io::BufWriter;
-use png::{Encoder, Compression, FilterType};
+use image::RgbImage;
+use rand::RngCore;
+use uuid::Uuid;
 
+use crate::{
+    crypto::{derive_base_key, derive_message_key, encrypt, sha256},
+    error::{Result, StegoError},
+    formats::{ChunkHeader, CHUNK_HEADER_SIZE},
+};
+
+use super::lsb::LsbWriter;
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
+
+/// Builder for [`StegoEncoder`].
+pub struct EncoderBuilder {
+    bits_per_channel: u8,
+}
+
+impl Default for EncoderBuilder {
+    fn default() -> Self {
+        Self {
+            bits_per_channel: 1,
+        }
+    }
+}
+
+impl EncoderBuilder {
+    /// Sets the bits-per-channel for payload embedding (default: 1).
+    pub fn bits_per_channel(mut self, bpc: u8) -> Self {
+        self.bits_per_channel = bpc;
+        self
+    }
+
+    /// Validates configuration and returns a [`StegoEncoder`].
+    pub fn build(self) -> Result<StegoEncoder> {
+        if self.bits_per_channel == 0 || self.bits_per_channel > 8 {
+            return Err(StegoError::InvalidBitsPerChannel(self.bits_per_channel));
+        }
+        Ok(StegoEncoder {
+            bits_per_channel: self.bits_per_channel,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+/// Encodes a secret message into one or more cover images using LSB steganography.
+///
+/// Create via [`StegoEncoder::builder()`].
+#[derive(Debug)]
 pub struct StegoEncoder {
-    pub bits_per_channel: u8,
-    pub password: Option<String>,
-    pub index_path: PathBuf,
+    bits_per_channel: u8,
 }
 
 impl StegoEncoder {
-    pub fn new(bits_per_channel: u8, password: Option<String>, index_path: PathBuf) -> Self {
-        if !(1..=3).contains(&bits_per_channel) {
-            panic!("bits_per_channel debe estar entre 1 y 3");
-        }
-        Self { bits_per_channel, password, index_path }
+    /// Returns a new [`EncoderBuilder`] with default settings.
+    pub fn builder() -> EncoderBuilder {
+        EncoderBuilder::default()
     }
 
-    pub fn encode_messages(&self, messages: &[&[u8]], directory: &Path) -> Result<Vec<(PathBuf, u32)>, String> {
-        let start = Instant::now();
-        let images = fs::read_dir(directory)
-            .map_err(|e| format!("No se pudo leer el directorio: {}", e))?
-            .filter_map(Result::ok)
-            .filter(|f| f.path().extension().map_or(false, |ext| ext == "png"))
-            .map(|f| f.path())
-            .collect::<Vec<_>>();
-
+    /// Splits `message` into chunks that fit within the given images.
+    ///
+    /// The header (88 bytes) is always written at bpc=1.
+    /// The payload (ciphertext + 16-byte GCM tag) is written at `bpc`.
+    pub(crate) fn split_message(
+        message: &[u8],
+        images: &[RgbImage],
+        bpc: u8,
+    ) -> Result<Vec<Vec<u8>>> {
         if images.is_empty() {
-            return Err("No se encontraron imágenes PNG".to_string());
+            return Err(StegoError::InvalidConfig("no cover images provided".into()));
         }
 
-        // Calcular capacidad de todas las imágenes
-        let mut image_capacities = Vec::new();
-        for path in &images {
-            let img = image::open(path).map_err(|e| format!("No se pudo abrir imagen {:?}: {}", path, e))?;
-            let (width, height) = img.dimensions();
-            let capacity = (width * height * 3 * self.bits_per_channel as u32) / 8;
-            println!("Imagen: {:?}, Capacidad: {} bytes", path, capacity);
-            image_capacities.push((path.clone(), capacity as usize));
+        const GCM_TAG: usize = 16;
+
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut remaining = message;
+
+        for img in images {
+            if remaining.is_empty() {
+                break;
+            }
+            let total_channels = img.width() as usize * img.height() as usize * 3;
+            // Header uses bpc=1 → CHUNK_HEADER_SIZE * 8 channel-slots at b=1
+            let header_channels = CHUNK_HEADER_SIZE * 8;
+            let payload_channels = total_channels.saturating_sub(header_channels);
+            let payload_bytes = payload_channels * bpc as usize / 8;
+            let plaintext_cap = payload_bytes.saturating_sub(GCM_TAG);
+
+            let take = remaining.len().min(plaintext_cap);
+            chunks.push(remaining[..take].to_vec());
+            remaining = &remaining[take..];
         }
 
-        // Crear la base de datos SQLite para el índice
-        let db_path = self.index_path.with_extension("db");
-        let index_db = MessageIndexDB::new(&db_path)
-            .map_err(|e| format!("No se pudo crear/abrir la base de datos de índices: {}", e))?;
+        if !remaining.is_empty() {
+            let total_available: usize = images
+                .iter()
+                .map(|img| {
+                    let total_channels = img.width() as usize * img.height() as usize * 3;
+                    let payload_channels = total_channels.saturating_sub(CHUNK_HEADER_SIZE * 8);
+                    payload_channels * bpc as usize / 8
+                })
+                .sum::<usize>()
+                .saturating_sub(images.len() * GCM_TAG);
+            return Err(StegoError::InsufficientCapacity {
+                needed: message.len(),
+                available: total_available,
+            });
+        }
 
-        let mut results = Vec::new();
+        if chunks.is_empty() {
+            chunks.push(Vec::new());
+        }
 
-        // Mapa para llevar un seguimiento de los bytes usados en cada imagen
-        let mut usado_por_imagen: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+        Ok(chunks)
+    }
 
-        for message in messages {
-            // Preparar el mensaje con encabezado
-            let encrypted = if let Some(ref password) = self.password {
-                encrypt_message(message, password)?
-            } else {
-                message.to_vec()
-            };
+    /// Encodes `message` into `cover_images` using `password`.
+    ///
+    /// Returns the stego images (one per chunk). The number of output images
+    /// is ≤ `cover_images.len()` and equals the number of chunks required.
+    pub fn encode(
+        self,
+        cover_images: Vec<RgbImage>,
+        message: &[u8],
+        password: &[u8],
+    ) -> Result<Vec<RgbImage>> {
+        if cover_images.is_empty() {
+            return Err(StegoError::InvalidConfig("no cover images provided".into()));
+        }
+        if cover_images.len() > 255 {
+            return Err(StegoError::InvalidConfig(
+                "too many cover images (max 255)".into(),
+            ));
+        }
 
-            let hash = hash_message(message);
-            let message_id = random::<u32>();
-            let header = StegoHeader {
-                total_length: encrypted.len() as u64,
-                current_offset: 0,
-                message_hash: hash,
+        let bpc = self.bits_per_channel;
+        let chunks = Self::split_message(message, &cover_images, bpc)?;
+        let total_chunks = chunks.len() as u8;
+
+        let message_id: [u8; 16] = *Uuid::new_v4().as_bytes();
+        let payload_hash = sha256(message);
+
+        let mut result_images = Vec::with_capacity(chunks.len());
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let cover = &cover_images[i];
+
+            let mut argon2_salt = [0u8; 16];
+            let mut aes_nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut argon2_salt);
+            rand::thread_rng().fill_bytes(&mut aes_nonce);
+
+            let base_key = derive_base_key(password, &argon2_salt)?;
+            let aes_key = derive_message_key(&base_key, &message_id)?;
+
+            let ciphertext_len = chunk.len() + 16; // 16-byte GCM tag
+
+            let header = ChunkHeader {
                 message_id,
-            }.to_bytes();
+                chunk_index: i as u8,
+                total_chunks,
+                payload_length: ciphertext_len as u64,
+                argon2_salt,
+                aes_nonce,
+                payload_hash,
+                bits_per_channel: bpc,
+                reserved: 0,
+            };
+            let header_bytes = header.to_bytes();
 
-            let full_data = [header.as_slice(), encrypted.as_slice()].concat();
-            println!("Tamaño del mensaje con ID {}: {} bytes", message_id, full_data.len());
+            let ciphertext = encrypt(&aes_key, &aes_nonce, chunk, &header_bytes)?;
 
-            // Buscar la imagen con mayor espacio disponible
-            let mut best_image = None;
-            let mut best_space = 0;
-
-            // Revisar cada imagen para encontrar la mejor candidata
-            for (idx, (path, capacity)) in image_capacities.iter().enumerate() {
-                let bytes_usados = usado_por_imagen.get(path).cloned().unwrap_or(0);
-                let espacio_disponible = *capacity - bytes_usados;
-
-                // Si hay suficiente espacio y es mejor que la opción actual
-                if espacio_disponible >= full_data.len() && espacio_disponible > best_space {
-                    best_image = Some(idx);
-                    best_space = espacio_disponible;
-                }
+            // Final capacity check
+            let total_channels = cover.width() as usize * cover.height() as usize * 3;
+            let header_channels = CHUNK_HEADER_SIZE * 8; // at bpc=1
+            let payload_channels_needed = (ciphertext.len() * 8).div_ceil(bpc as usize);
+            if header_channels + payload_channels_needed > total_channels {
+                return Err(StegoError::InsufficientCapacity {
+                    needed: CHUNK_HEADER_SIZE + ciphertext.len(),
+                    available: total_channels * bpc as usize / 8,
+                });
             }
 
-            // Si encontramos una imagen adecuada
-            if let Some(idx) = best_image {
-                let path = &image_capacities[idx].0;
-                let bytes_usados = usado_por_imagen.get(path).cloned().unwrap_or(0);
-
-                // Escribir el mensaje completo en la imagen
-                let mut img_buf = image::open(path)
-                    .map_err(|e| format!("No se pudo abrir imagen {:?}: {}", path, e))?
-                    .to_rgb8();
-
-                self.write_data_from_offset(&mut img_buf, &full_data, bytes_usados)?;
-                img_buf.save(path).map_err(|e| format!("Error al guardar imagen: {}", e))?;
-
-                // Actualizar el espacio usado
-                let nuevo_usado = bytes_usados + full_data.len();
-                usado_por_imagen.insert(path.clone(), nuevo_usado);
-
-                let espacio_restante = image_capacities[idx].1 - nuevo_usado;
-                println!(
-                    "Mensaje con ID {} ocultado en {:?}. Espacio restante: {} bytes",
-                    message_id, path, espacio_restante
-                );
-
-                // Registrar en la base de datos
-                index_db.register(
-                    message_id,
-                    path,
-                    bytes_usados,
-                    &hash
-                ).map_err(|e| format!("Error al registrar mensaje en índice: {}", e))?;
-
-                results.push((path.clone(), message_id));
-            } else {
-                // No se encontró ninguna imagen con espacio suficiente
-                return Err(format!(
-                    "No hay espacio suficiente en ninguna imagen para el mensaje con ID {}. Se necesitan {} bytes",
-                    message_id, full_data.len()
-                ));
-            }
+            let mut writer = LsbWriter::new(cover.clone());
+            writer.write_bits(&header_bytes, 1)?;
+            writer.write_bits(&ciphertext, bpc)?;
+            result_images.push(writer.into_image());
         }
 
-        info!("Todos los mensajes fueron ocultados en {:?} ms", start.elapsed().as_millis());
-        Ok(results)
+        Ok(result_images)
     }
-
-    fn write_data_from_offset(&self, img: &mut RgbImage, data: &[u8], offset_bytes: usize) -> Result<(), String> {
-        let total_bits = data.len() * 8;
-        let mut bit_idx = 0;
-
-        let start_bit = offset_bytes * 8;
-        let total_channels = 3; // RGB
-        let pixels_per_row = img.width() as usize;
-
-        let mut pixel_idx = start_bit / total_channels;
-        let mut channel_idx = start_bit % total_channels;
-
-        while bit_idx < total_bits {
-            let y = pixel_idx / pixels_per_row;
-            let x = pixel_idx % pixels_per_row;
-
-            if y >= img.height() as usize {
-                return Err("No hay suficiente espacio en la imagen".to_string());
-            }
-
-            let pixel = img.get_pixel_mut(x as u32, y as u32);
-            let byte = data[bit_idx / 8];
-            let bit_pos = 7 - (bit_idx % 8);
-            let bit = (byte >> bit_pos) & 1;
-
-            let mask = !(1 << (self.bits_per_channel - 1));
-            pixel[channel_idx] = (pixel[channel_idx] & mask) | (bit << (self.bits_per_channel - 1));
-
-            bit_idx += 1;
-            channel_idx += 1;
-            if channel_idx >= total_channels {
-                channel_idx = 0;
-                pixel_idx += 1;
-            }
-        }
-
-        Ok(())
-    }
-
 }
 
-fn count_used_bytes(img: &RgbImage, bits_per_channel: u8) -> usize {
-    let mask = (1 << bits_per_channel) - 1;
-    let used_bits = img.pixels()
-        .flat_map(|p| p.0.iter())
-        .filter(|&&c| (c & mask) != 0)
-        .count();
-    (used_bits + 7) / 8
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbImage;
+
+    fn blank(w: u32, h: u32) -> RgbImage {
+        RgbImage::new(w, h)
+    }
+
+    #[test]
+    fn builder_default_succeeds() {
+        assert!(StegoEncoder::builder().build().is_ok());
+    }
+
+    #[test]
+    fn builder_bpc0_fails() {
+        let err = StegoEncoder::builder()
+            .bits_per_channel(0)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, StegoError::InvalidBitsPerChannel(0)));
+    }
+
+    #[test]
+    fn builder_bpc2_canonical() {
+        assert!(StegoEncoder::builder().bits_per_channel(2).build().is_ok());
+    }
+
+    #[test]
+    fn split_300_bytes_fits_in_one_100x100() {
+        let images: Vec<RgbImage> = vec![blank(100, 100)];
+        let msg: Vec<u8> = (0..300).map(|b| b as u8).collect();
+        let chunks = StegoEncoder::split_message(&msg, &images, 1).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 300);
+    }
+
+    #[test]
+    fn split_50_bytes_3_images_single_chunk() {
+        let images: Vec<RgbImage> = (0..3).map(|_| blank(100, 100)).collect();
+        let msg = vec![0u8; 50];
+        let chunks = StegoEncoder::split_message(&msg, &images, 1).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 50);
+    }
+
+    #[test]
+    fn encode_10_bytes_100x100_succeeds() {
+        let cover = vec![blank(100, 100)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let out = enc.encode(cover, b"hello enc!", b"pass").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].width(), 100);
+    }
+
+    #[test]
+    fn encode_1mb_into_10x10_insufficient_capacity() {
+        let cover = vec![blank(10, 10)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let msg = vec![0u8; 1024 * 1024];
+        let err = enc.encode(cover, &msg, b"pass").unwrap_err();
+        assert!(matches!(err, StegoError::InsufficientCapacity { .. }));
+    }
 }

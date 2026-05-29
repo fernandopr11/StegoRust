@@ -1,128 +1,147 @@
-# SteganoRust Documentation
+# StegoRust
 
-SteganoRust is a Rust library for steganography that hides messages inside PNG images using the LSB (Least Significant Bit) technique. It features AES-256-GCM encryption and a database to track message storage locations.
+[![Crates.io](https://img.shields.io/crates/v/stego_rust.svg)](https://crates.io/crates/stego_rust)
+[![Docs.rs](https://docs.rs/stego_rust/badge.svg)](https://docs.rs/stego_rust)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-## Project structure
+A Rust library for hiding encrypted messages inside PNG images using **LSB (Least Significant Bit) steganography**, backed by AES-256-GCM authenticated encryption and Argon2id key derivation.
 
-``` bash
-📁 src/
-├── 📁 core/
-│ ├──── 🧩 decoder.rs - 🕵️‍♂️ Extracts hidden messages from images
-│ └└── 🧩 encoder.rs - ✍️ Inserts messages in PNG images
-├─── 📁 crypto/
-│ └─── 🔐 crypto.rs - 🛡️ Encryption and hashing utilities.
-├─── 📁 formats/
-│ └└─── 🗂️ header.rs - 🧾 Message metadata structure.
-└─── 📁 utils/
-    └─── 🗃️ index_db.rs - 🧮 SQLite database for message tracking.
+---
+
+## Features
+
+- **AES-256-GCM encryption** — every chunk is individually encrypted with a unique nonce
+- **Argon2id key derivation** — password-based key stretching (m=19 MiB, t=2, p=1) resistant to GPU and ASIC attacks
+- **HKDF-SHA256 per-message keys** — each message gets its own derived AES key from the base key and a unique `message_id`
+- **SHA-256 integrity check** — full plaintext hash stored in the header, verified after reassembly
+- **Message spanning** — large messages auto-split across multiple images; each chunk is independent and self-describing
+- **Configurable bit depth** — 1–8 bits per channel trades invisibility for capacity
+- **No external index files** — all metadata embedded directly in image LSBs
+
+---
+
+## Quick Start
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+stego_rust = "0.2"
 ```
 
-# 🔧 **Core Components**
+### Encode a message
 
-## 🧩 **Encoder** (`core/encoder.rs`)
+```rust
+use stego_rust::core::encoder::StegoEncoder;
+use image::DynamicImage;
 
-The **StegoEncoder** is responsible for **inserting messages** into PNG images. The main features and capabilities of this component are detailed below:
+// Load one or more cover images
+let cover_images: Vec<DynamicImage> = vec![
+    image::open("cover1.png")?,
+    image::open("cover2.png")?,
+];
 
-### Encoder Features
+let stego_images = StegoEncoder::builder()
+    .bits_per_channel(1)   // 1–8; lower = more invisible, less capacity
+    .build()?
+    .encode(cover_images, b"secret message", b"my-password")?;
 
-* Configurable bit depth**: Use 1 to 3 Least Significant Bits (LSBs) per RGB channel to hide the message.
-* Password protection**: AES-256-GCM encryption** can be optionally applied to protect the hidden message.
-* Automatic distribution**: If the message is too large for a single image, it is automatically divided into multiple images.
-* **Capacity monitoring**: Keeps track of the available space in each image, ensuring that the capacity limits of the images are not exceeded.
-
-### Example of Use
-
-Below is an example of how to initialize and use the **StegoEncoder** to hide messages in a series of PNG images:
-
-``` rust
-let encoder = StegoEncoder::new(
-    2, // 2 bits per channel (RGB)
-    Some(“password”.to_string()), // Optional password for encryption
-    PathBuf::from(“index”) // Path to the index database.
-);
-
-// Hide messages in images within the directory
-let results = encoder.encode_messages(&messages, Path::new(“./images”))?;
+// Save the output images
+for (i, img) in stego_images.iter().enumerate() {
+    img.save(format!("stego_{}.png", i))?;
+}
 ```
 
-## 🧩 **Decoder** (`core/decoder.rs`)
+### Decode a message
 
-The **StegoDecoder** is responsible for **extracting hidden messages** in PNG images. The main features and capabilities of this component are listed below:
+```rust
+use stego_rust::core::decoder::StegoDecoder;
+use image::DynamicImage;
 
-### Decoder Features.
+let stego_images: Vec<DynamicImage> = vec![
+    image::open("stego_0.png")?,
+];
 
-* Targeted retrieval**: Allows to extract specific messages using a unique identifier (ID).
-* **Batch extraction**: Can retrieve all hidden messages in images at once.
-* Integrity check**: Verifies the validity of messages by checking the hashes.
-* **Transparent decryption**: Handles decryption of messages using AES, provided the correct password is supplied.
+let message = StegoDecoder::builder()
+    .build()
+    .decode(stego_images, b"my-password")?;
 
-### Example of Use
-
-Below is an example of how to initialize and use the **StegoDecoder** to extract messages from PNG images:
-
-``` rust
-let decoder = StegoDecoder::new(
-    2, // Must match the bit depth used in the encryption.
-    Some(“password”.to_string()), // Necessary if message was encrypted
-    “index”.to_string() // Path to index database.
-);
-
-// Decode all hidden messages
-let all_messages = decoder.decode_all_messages()?;      
+println!("{}", String::from_utf8(message)?);
 ```
 
-# 📦 **Message Header in SteganoRust**
+---
 
-The **StegoHeader** defined in `src/formats/header.rs` is a crucial component of the **SteganoRust** steganography system. This header is prefixed to each message before being inserted into the image, and contains essential information for the correct retrieval and verification of the hidden message.
+## Security Model
 
-## 🏗️ **Header Structure**.
+StegoRust uses a layered cryptographic approach designed so that an attacker with access to the output images cannot recover the message without the password.
 
-The header is a fixed 36-byte structure containing the following information:
+### Key Derivation
 
-| Field                        | Size    | Description                                                          |
-|------------------------------|---------|----------------------------------------------------------------------|
-| **Magic (4 bytes)**          | 4 bytes |It always contains “STEG” to identify steganographic data.            |
-| Version (1 byte)**           | 1 byte  |Version of the format, currently 1.                                   | 
-| **Total Length (8 bytes)**   | 8 bytes | Size of the encrypted/encrypted message in bytes.                    |
-| **Current Offset (8 bytes)** | 8 bytes | Position within multipart messages (if the message is split into several images). |
-| **Message Hash (8 bytes)**   | 8 bytes | First 8 bytes of the SHA-256 hash of the original message to verify its integrity. |
-| Message ID (4 bytes)**       | 4 bytes | 32-bit random identifier used for message retrieval.                 |
-| **Reserved (3 bytes)**       | 3 bytes | Unused space for future extensions.                                  | 
+1. **Argon2id** derives a 32-byte base key from the password and a random 16-byte salt stored in the chunk header.
+   Parameters: `m=19456 KiB`, `t=2`, `p=1` — expensive on commodity hardware, usable on embedded targets.
 
-## 🛠️ **Header Implementation**
+2. **HKDF-SHA256** derives a unique per-message AES key from the base key and the `message_id` (a random UUID generated at encode time).
+   Two messages encoded with the same password cannot share key material.
 
-The `StegoHeader` structure provides two main methods for handling the header:
+### Encryption
 
-### Methods
+Each chunk payload is encrypted with **AES-256-GCM**. The 88-byte `ChunkHeader` is passed as **AAD** (Additional Authenticated Data) — authenticated by the GCM tag but not encrypted, so the decoder can read routing metadata before decrypting.
 
-* **`to_bytes()`**: Serializes the header into an array of 36 bytes. This method converts the structure into a binary format that can be easily inserted into the image or transmitted.
-* **`from_bytes()`**: Takes an array of bytes and parses it to reconstruct the header structure, ensuring that the data is valid and consistent with the expected format.
+### Integrity
 
-# 🔐 Module `crypto.rs`.
+A **SHA-256 hash of the full plaintext** is stored in every chunk header. After all chunks are reassembled the hash is re-verified, catching tampering or accidental corruption at the byte level.
 
-Implementation of basic cryptographic operations for secure encryption and hashing.
+### Threat model summary
 
-## 📋 Summary of Functions
+| Attack | Defence |
+|--------|---------|
+| Pixel modification | AES-GCM tag verification fails |
+| Chunk reordering / swapping | SHA-256 integrity check fails |
+| Password brute-force | Argon2id (memory-hard, intentionally slow) |
+| Key reuse across messages | HKDF per `message_id` — keys never repeat |
 
-| Field    | Description   |
-|----------|---------------|
-| **hash_message** |  📊 Generates a truncated SHA-256 hash             |
-| **encrypt_message**     | 🔒 Data encryption with AES-256-GCM              |
-| **decrypt_message** |    🔓 Decrypts data encrypted with AES-256-GCM           | 
+---
 
-# 📁 MessageIndexDB
+## Capacity Guide
 
-SQLite database for indexing hidden messages in images.
+Usable bytes per megapixel (1 MP = 1 000 000 pixels × 3 channels), after the 88-byte header is subtracted:
 
-## 🛠️ Main methods
+| Bits per channel | 1 MP image | 8 MP image | 12 MP image |
+|-----------------|-----------|-----------|------------|
+| 1               | ~342 KB   | ~2.7 MB   | ~4.1 MB    |
+| 2               | ~685 KB   | ~5.5 MB   | ~8.2 MB    |
+| 4               | ~1.4 MB   | ~11 MB    | ~16.8 MB   |
+| 8               | ~2.9 MB   | ~22 MB    | ~34.3 MB   |
 
-| Método | Descripción |
-| --- | --- |
-| `new()` | 🆕 Creates or connects to the database  |
-| `register()` | 📝 Saves a new message in the index |
-| `get_message_location()` | 🔍 Finds a message by its message ID|
-| `get_all_messages()` | 📋 Lists all registered messages |
+Use `bpc=1` for maximum stealth. Increase only when the message does not fit across the available images.
 
-## 💾 Stored data
+---
 
-The database manages essential information about each steganographic message, including its unique identifier, the path to the image file containing it, the exact position in bytes where the message begins within the file, and a hash to verify the integrity of the content.
+## Message Spanning
+
+When a message is too large for a single image, `StegoEncoder` automatically splits it into chunks — one chunk per image. Each chunk carries:
+
+- A shared `message_id` (UUID) identifying the original message
+- Its `chunk_index` and `total_chunks` for reassembly ordering
+- Its own Argon2id salt and AES nonce — independently decryptable
+
+`StegoDecoder` collects all chunks, sorts them by `chunk_index`, verifies the SHA-256 integrity hash, and returns the reassembled plaintext. You must provide at least as many cover images as the encoder produces chunks; otherwise encoding returns an error.
+
+---
+
+## ChunkHeader Format
+
+Each image stores an 88-byte self-describing header at `bpc=1` (independent of the configured bit depth for the payload):
+
+```
+message_id(16) | chunk_index(1) | total_chunks(1) | payload_length(8) |
+argon2_salt(16) | aes_nonce(12) | payload_hash(32) | bits_per_channel(1) | reserved(1)
+```
+
+This design means a decoder only needs the image and the password — no sidecar files.
+
+---
+
+## License
+
+Licensed under the [GNU General Public License v3.0](LICENSE).

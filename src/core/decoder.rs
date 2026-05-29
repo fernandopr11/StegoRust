@@ -1,126 +1,187 @@
-use image::GenericImageView;
-use std::fs;
-use std::path::Path;
-use log::info;
-use std::time::Instant;
-use crate::crypto::crypto::{decrypt_message, hash_message};
-use crate::formats::header::{StegoHeader, HEADER_SIZE};
-use crate::utils::index_db::MessageIndexDB;
+use std::collections::HashMap;
 
+use image::RgbImage;
+
+use crate::{
+    crypto::{decrypt, derive_base_key, derive_message_key, sha256},
+    error::{Result, StegoError},
+    formats::{ChunkHeader, CHUNK_HEADER_SIZE},
+};
+
+use super::lsb::LsbReader;
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
+
+/// Builder for [`StegoDecoder`].
+#[derive(Default)]
+pub struct DecoderBuilder {
+    _priv: (),
+}
+
+impl DecoderBuilder {
+    /// Returns a configured [`StegoDecoder`].
+    pub fn build(self) -> StegoDecoder {
+        StegoDecoder { _priv: () }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoded chunk
+// ---------------------------------------------------------------------------
+
+/// Result of decoding a single stego image.
+pub struct DecodedChunk {
+    /// UUID identifying the logical message this chunk belongs to.
+    pub message_id: [u8; 16],
+    /// 0-based position of this chunk within the message.
+    pub chunk_index: u8,
+    /// Total number of chunks in the message.
+    pub total_chunks: u8,
+    /// Decrypted plaintext payload of this chunk.
+    pub payload: Vec<u8>,
+    /// SHA-256 of the full reassembled plaintext (from the header).
+    pub payload_hash: [u8; 32],
+}
+
+// ---------------------------------------------------------------------------
+// Decoder
+// ---------------------------------------------------------------------------
+
+/// Decodes a secret message from one or more stego images.
+///
+/// Create via [`StegoDecoder::builder()`].
 pub struct StegoDecoder {
-    pub bits_per_channel: u8,
-    pub password: Option<String>,
-    pub index_path: String,
+    _priv: (),
 }
 
 impl StegoDecoder {
-    pub fn new(bits_per_channel: u8, password: Option<String>, index_path: String) -> Self {
-        if !(1..=3).contains(&bits_per_channel) {
-            panic!("bits_per_channel debe estar entre 1 y 3");
-        }
-        Self { bits_per_channel, password, index_path }
+    /// Returns a new [`DecoderBuilder`].
+    pub fn builder() -> DecoderBuilder {
+        DecoderBuilder::default()
     }
 
-    pub fn decode_all_messages(&self) -> Result<Vec<Vec<u8>>, String> {
-        let start = Instant::now();
+    /// Decodes a single stego image using `password`.
+    ///
+    /// The header is always read at bpc=1 (bootstrap convention). If
+    /// `header.bits_per_channel != 1` the payload is read at the declared bpc.
+    ///
+    /// Returns [`StegoError::AuthenticationFailed`] on wrong password or tamper.
+    pub fn decode_image(img: &RgbImage, password: &[u8]) -> Result<DecodedChunk> {
+        // Step 1: read header at bpc=1
+        let mut reader = LsbReader::new(img);
+        let header_bytes = reader.read_bits(CHUNK_HEADER_SIZE, 1)?;
+        let header = ChunkHeader::from_bytes(&header_bytes)?;
 
-        // Abrir la base de datos SQLite para el índice
-        let db_path = Path::new(&self.index_path).with_extension("db");
-        let index_db = MessageIndexDB::new(db_path.as_path())
-            .map_err(|e| format!("No se pudo abrir la base de datos: {}", e))?;
+        // Step 2: read payload at header.bits_per_channel
+        let bpc = header.bits_per_channel;
+        let ct_len = header.payload_length as usize;
 
-        // Obtener información de todos los mensajes
-        let all_messages = index_db.get_all_messages()
-            .map_err(|e| format!("Error al recuperar mensajes del índice: {}", e))?;
+        // If bpc != 1 the payload bytes start right after the header in the bpc stream.
+        // The header consumed CHUNK_HEADER_SIZE * 8 bit-slots at bpc=1 = CHUNK_HEADER_SIZE*8
+        // channels. The payload starts at channel CHUNK_HEADER_SIZE*8 (bpc=1 slots).
+        // We need to re-position the reader for bpc > 1.
+        let ciphertext = if bpc == 1 {
+            reader.read_bits(ct_len, bpc)?
+        } else {
+            // Payload is at channel_idx = CHUNK_HEADER_SIZE * 8 (each bpc=1 slot = 1 channel).
+            // For bpc-based reading we start at that same channel offset.
+            let mut pr = LsbReader::new_at(img, CHUNK_HEADER_SIZE * 8);
+            pr.read_bits(ct_len, bpc)?
+        };
 
-        let mut messages = Vec::new();
+        // Step 3: derive key
+        let base_key = derive_base_key(password, &header.argon2_salt)?;
+        let aes_key = derive_message_key(&base_key, &header.message_id)?;
 
-        for (message_id, image_path, offset_bytes) in all_messages {
-            match self.decode_message_from_location(&image_path, offset_bytes) {
-                Ok(message) => messages.push(message),
-                Err(e) => info!("Error al decodificar mensaje {}: {}", message_id, e),
-            }
-        }
+        // Step 4: decrypt (header bytes as AAD)
+        let plaintext = decrypt(&aes_key, &header.aes_nonce, &ciphertext, &header_bytes)?;
 
-        info!("Se recuperaron {} mensajes en {:?} ms", messages.len(), start.elapsed().as_millis());
-        Ok(messages)
+        // Step 5: hash check — verify partial chunk integrity (for single-image decoding)
+        // The full-message hash is validated in decode() after reassembly.
+
+        Ok(DecodedChunk {
+            message_id: header.message_id,
+            chunk_index: header.chunk_index,
+            total_chunks: header.total_chunks,
+            payload: plaintext,
+            payload_hash: header.payload_hash,
+        })
     }
 
-    pub fn decode_message(&self, message_id: u32) -> Result<Vec<u8>, String> {
-        let db_path = Path::new(&self.index_path).with_extension("db");
-        let index_db = MessageIndexDB::new(db_path.as_path())
-            .map_err(|e| format!("No se pudo abrir la base de datos: {}", e))?;
+    /// Decodes all chunks from `images` and reassembles the original message.
+    ///
+    /// Images may be provided in any order. All chunks must belong to the same
+    /// logical message (same `message_id`).
+    pub fn decode(self, images: Vec<RgbImage>, password: &[u8]) -> Result<Vec<u8>> {
+        let mut chunks: HashMap<u8, DecodedChunk> = HashMap::new();
+        let mut expected_total: Option<u8> = None;
+        let mut expected_msg_id: Option<[u8; 16]> = None;
+        let mut expected_hash: Option<[u8; 32]> = None;
 
-        // Obtener ubicación exacta del mensaje
-        let (image_path, offset_bytes) = index_db.get_message_location(message_id)
-            .map_err(|e| format!("Error al buscar mensaje: {}", e))?
-            .ok_or_else(|| format!("Mensaje con ID {} no encontrado", message_id))?;
+        for img in &images {
+            let chunk = Self::decode_image(img, password)?;
 
-        self.decode_message_from_location(&image_path, offset_bytes)
-    }
-
-    fn decode_message_from_location(&self, image_path: &str, offset_bytes: usize) -> Result<Vec<u8>, String> {
-        let img = image::open(image_path)
-            .map_err(|e| format!("No se pudo abrir la imagen: {}", e))?;
-        let img_buf = img.to_rgb8();
-
-        let mut data = Vec::new();
-        let mut current_byte = 0u8;
-        let mut bit_count = 0;
-
-        let total_channels = 3;
-        let pixels_per_row = img_buf.width() as usize;
-
-        let start_pixel_idx = offset_bytes * 8 / total_channels;
-        let start_channel = offset_bytes * 8 % total_channels;
-
-        let mut pixel_idx = start_pixel_idx;
-        let mut channel_idx = start_channel;
-
-        loop {
-            let y = pixel_idx / pixels_per_row;
-            let x = pixel_idx % pixels_per_row;
-
-            if y >= img_buf.height() as usize {
-                break;
-            }
-
-            let pixel = img_buf.get_pixel(x as u32, y as u32);
-            let bit = (pixel[channel_idx] >> (self.bits_per_channel - 1)) & 1;
-
-            current_byte = (current_byte << 1) | bit;
-            bit_count += 1;
-
-            if bit_count == 8 {
-                data.push(current_byte);
-                current_byte = 0;
-                bit_count = 0;
-
-                if data.len() >= HEADER_SIZE {
-                    let header = StegoHeader::from_bytes(&data[0..HEADER_SIZE])?;
-                    if data.len() >= HEADER_SIZE + header.total_length as usize {
-                        let encrypted = &data[HEADER_SIZE..HEADER_SIZE + header.total_length as usize];
-                        let decrypted = if let Some(ref password) = self.password {
-                            decrypt_message(encrypted, password)?
-                        } else {
-                            encrypted.to_vec()
-                        };
-
-                        let computed_hash = hash_message(&decrypted);
-                        if computed_hash == header.message_hash {
-                            return Ok(decrypted);
-                        }
-                    }
+            // Cross-image consistency checks
+            if let Some(id) = expected_msg_id {
+                if id != chunk.message_id {
+                    return Err(StegoError::MixedMessages);
                 }
+            } else {
+                expected_msg_id = Some(chunk.message_id);
             }
 
-            channel_idx += 1;
-            if channel_idx >= total_channels {
-                channel_idx = 0;
-                pixel_idx += 1;
+            if let Some(t) = expected_total {
+                if t != chunk.total_chunks {
+                    return Err(StegoError::InvalidHeader);
+                }
+            } else {
+                expected_total = Some(chunk.total_chunks);
             }
+
+            expected_hash = Some(chunk.payload_hash);
+
+            if chunks.contains_key(&chunk.chunk_index) {
+                return Err(StegoError::DuplicateChunk(chunk.chunk_index));
+            }
+            chunks.insert(chunk.chunk_index, chunk);
         }
 
-        Err("No se pudo recuperar un mensaje válido de los datos extraídos".to_string())
+        let total = expected_total.unwrap_or(0) as usize;
+        if chunks.len() != total {
+            return Err(StegoError::MissingChunks {
+                found: chunks.len(),
+                expected: total,
+            });
+        }
+
+        // Reassemble in order
+        let mut message = Vec::new();
+        for i in 0..total as u8 {
+            let chunk = chunks.remove(&i).ok_or(StegoError::MissingChunks {
+                found: chunks.len(),
+                expected: total,
+            })?;
+            message.extend_from_slice(&chunk.payload);
+        }
+
+        // Final integrity check
+        let hash = sha256(&message);
+        if hash != expected_hash.unwrap_or([0u8; 32]) {
+            return Err(StegoError::IntegrityCheckFailed);
+        }
+
+        Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_constructs() {
+        let _dec = StegoDecoder::builder().build();
     }
 }
