@@ -21,7 +21,8 @@
 //! # Ok::<(), stego_rust::StegoError>(())
 //! ```
 
-#![deny(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod core;
 mod crypto;
