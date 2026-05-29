@@ -28,6 +28,17 @@ impl LsbWriter {
         }
     }
 
+    /// Creates a new writer starting at a specific channel index.
+    ///
+    /// Used by the multi-message encoder to append after existing data.
+    pub fn new_at(img: RgbImage, channel_idx: usize) -> Self {
+        Self {
+            img,
+            channel_idx,
+            bit_in_slot: 0,
+        }
+    }
+
     /// Writes `data` bytes MSB-first into the image at `bpc` bits per channel.
     ///
     /// Returns [`StegoError::InsufficientCapacity`] if the image runs out of space.

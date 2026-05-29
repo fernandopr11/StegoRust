@@ -110,10 +110,118 @@ impl StegoDecoder {
         })
     }
 
+    /// Scans `img` for ALL [`ChunkHeader`]s sequentially (at bpc=1 bootstrap).
+    /// Tries to decrypt each chunk with `password`. Skips chunks where authentication
+    /// fails (wrong password for that message or padding). Stops at the first
+    /// structurally invalid header.
+    pub fn scan_image(img: &RgbImage, password: &[u8]) -> Vec<DecodedChunk> {
+        use rayon::prelude::*;
+
+        let total = img.width() as usize * img.height() as usize * 3;
+        let mut channel_idx = 0;
+
+        // Phase 1: scan headers sequentially (fast — just bit reads, no crypto)
+        let mut work_items: Vec<(usize, Vec<u8>, ChunkHeader)> = Vec::new();
+        loop {
+            if channel_idx + CHUNK_HEADER_SIZE * 8 > total { break; }
+            let mut reader = LsbReader::new_at(img, channel_idx);
+            let Ok(header_bytes) = reader.read_bits(CHUNK_HEADER_SIZE, 1) else { break };
+            let Ok(header) = ChunkHeader::from_bytes(&header_bytes) else { break };
+
+            let bpc = header.bits_per_channel;
+            let ct_len = header.payload_length as usize;
+            let payload_channels = (ct_len * 8).div_ceil(bpc as usize);
+            let payload_channel_start = channel_idx + CHUNK_HEADER_SIZE * 8;
+
+            // Read ciphertext bytes (still sequential — pixel reads are not thread-safe)
+            let ciphertext = if bpc == 1 {
+                reader.read_bits(ct_len, bpc)
+            } else {
+                LsbReader::new_at(img, payload_channel_start).read_bits(ct_len, bpc)
+            };
+
+            channel_idx += CHUNK_HEADER_SIZE * 8 + payload_channels;
+
+            if let Ok(ct) = ciphertext {
+                work_items.push((channel_idx, ct, header));
+            }
+            if channel_idx >= total { break; }
+        }
+
+        // Phase 2: decrypt all chunks in parallel (Argon2id is the bottleneck)
+        work_items
+            .into_par_iter()
+            .filter_map(|(_, ciphertext, header)| {
+                let header_bytes = header.to_bytes();
+                let base_key = crate::crypto::derive_base_key(password, &header.argon2_salt).ok()?;
+                let aes_key = crate::crypto::derive_message_key(&base_key, &header.message_id).ok()?;
+                let plaintext = crate::crypto::decrypt(
+                    &aes_key, &header.aes_nonce, &ciphertext, &header_bytes,
+                ).ok()?;
+                Some(DecodedChunk {
+                    message_id: header.message_id,
+                    chunk_index: header.chunk_index,
+                    total_chunks: header.total_chunks,
+                    payload: plaintext,
+                    payload_hash: header.payload_hash,
+                })
+            })
+            .collect()
+    }
+
+    /// Decodes ALL messages from `images` that can be decrypted with `password`.
+    ///
+    /// Returns a [`Vec`] of recovered plaintexts, one per logical `message_id` found.
+    /// Messages whose chunks span multiple images are reassembled automatically.
+    /// Use [`decode`] for single-message backward compatibility.
+    pub fn decode_many(self, images: Vec<RgbImage>, password: &[u8]) -> Result<Vec<Vec<u8>>> {
+        // Collect all decoded chunks across all images, keyed by message_id
+        let mut by_id: HashMap<[u8; 16], Vec<DecodedChunk>> = HashMap::new();
+
+        for img in &images {
+            for chunk in Self::scan_image(img, password) {
+                by_id.entry(chunk.message_id).or_default().push(chunk);
+            }
+        }
+
+        if by_id.is_empty() {
+            return Err(StegoError::AuthenticationFailed);
+        }
+
+        let mut messages = Vec::new();
+
+        for (_id, mut chunks) in by_id {
+            chunks.sort_by_key(|c| c.chunk_index);
+            let total = chunks[0].total_chunks as usize;
+            if chunks.len() != total {
+                return Err(StegoError::MissingChunks {
+                    found: chunks.len(),
+                    expected: total,
+                });
+            }
+            let expected_hash = chunks[0].payload_hash;
+            let mut message = Vec::new();
+            for chunk in chunks {
+                message.extend_from_slice(&chunk.payload);
+            }
+            let hash = crate::crypto::sha256(&message);
+            if hash != expected_hash {
+                return Err(StegoError::IntegrityCheckFailed);
+            }
+            messages.push(message);
+        }
+
+        Ok(messages)
+    }
+
     /// Decodes all chunks from `images` and reassembles the original message.
     ///
     /// Images may be provided in any order. All chunks must belong to the same
-    /// logical message (same `message_id`).
+    /// logical message (same `message_id`). For multi-message images, only the
+    /// first successfully decrypted message is returned. Use [`decode_many`] to
+    /// recover all messages.
+    ///
+    /// [`decode_many`]: StegoDecoder::decode_many
     pub fn decode(self, images: Vec<RgbImage>, password: &[u8]) -> Result<Vec<u8>> {
         let mut chunks: HashMap<u8, DecodedChunk> = HashMap::new();
         let mut expected_total: Option<u8> = None;
@@ -179,9 +287,77 @@ impl StegoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::encoder::StegoEncoder;
+    use image::RgbImage;
+
+    fn blank(w: u32, h: u32) -> RgbImage {
+        RgbImage::new(w, h)
+    }
 
     #[test]
     fn builder_constructs() {
         let _dec = StegoDecoder::builder().build();
+    }
+
+    #[test]
+    fn scan_image_empty_returns_nothing() {
+        let img = blank(100, 100);
+        let chunks = StegoDecoder::scan_image(&img, b"any");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn scan_image_finds_one_message() {
+        let cover = vec![blank(200, 200)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let stego = enc.encode(cover, b"hello scan", b"pass").unwrap();
+        let chunks = StegoDecoder::scan_image(&stego[0], b"pass");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].payload, b"hello scan");
+    }
+
+    #[test]
+    fn scan_image_wrong_password_skips_chunk() {
+        let cover = vec![blank(200, 200)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let stego = enc.encode(cover, b"secret", b"correct").unwrap();
+        // Wrong password — chunk is present but auth fails, so scan returns nothing
+        let chunks = StegoDecoder::scan_image(&stego[0], b"wrong");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn decode_many_two_messages_one_image() {
+        let cover = vec![blank(300, 300)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let msgs: &[&[u8]] = &[b"message one", b"message two"];
+        let stego = enc.encode_many(cover, msgs, b"pass").unwrap();
+
+        let dec = StegoDecoder::builder().build();
+        let mut recovered = dec.decode_many(stego, b"pass").unwrap();
+        assert_eq!(recovered.len(), 2);
+        // Sort for deterministic comparison
+        recovered.sort();
+        let mut expected = vec![b"message one".to_vec(), b"message two".to_vec()];
+        expected.sort();
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn decode_many_no_messages_returns_error() {
+        let img = blank(100, 100);
+        let dec = StegoDecoder::builder().build();
+        let err = dec.decode_many(vec![img], b"pass").unwrap_err();
+        assert!(matches!(err, StegoError::AuthenticationFailed));
+    }
+
+    #[test]
+    fn decode_many_wrong_password_returns_error() {
+        let cover = vec![blank(200, 200)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let stego = enc.encode_many(cover, &[b"secret" as &[u8]], b"correct").unwrap();
+        let dec = StegoDecoder::builder().build();
+        let err = dec.decode_many(stego, b"wrong").unwrap_err();
+        assert!(matches!(err, StegoError::AuthenticationFailed));
     }
 }

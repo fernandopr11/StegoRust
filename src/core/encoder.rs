@@ -8,7 +8,7 @@ use crate::{
     formats::{ChunkHeader, CHUNK_HEADER_SIZE},
 };
 
-use super::lsb::LsbWriter;
+use super::lsb::{LsbReader, LsbWriter};
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -55,6 +55,36 @@ impl EncoderBuilder {
 #[derive(Debug)]
 pub struct StegoEncoder {
     bits_per_channel: u8,
+}
+
+/// Scans `img` sequentially reading [`ChunkHeader`]s at bpc=1 to find how many
+/// channels are already occupied by existing messages. Stops at the first
+/// invalid header. This is O(n_messages), not O(pixels).
+pub fn scan_used_channels(img: &RgbImage) -> usize {
+    let total = img.width() as usize * img.height() as usize * 3;
+    let mut channel_idx = 0;
+    loop {
+        // Need room for at least one header
+        if channel_idx + CHUNK_HEADER_SIZE * 8 > total {
+            break;
+        }
+        let mut reader = LsbReader::new_at(img, channel_idx);
+        let Ok(header_bytes) = reader.read_bits(CHUNK_HEADER_SIZE, 1) else {
+            break;
+        };
+        let Ok(header) = ChunkHeader::from_bytes(&header_bytes) else {
+            break;
+        };
+        // Advance past header (bpc=1) + payload (bpc=header.bits_per_channel)
+        let header_channels = CHUNK_HEADER_SIZE * 8;
+        let payload_channels = (header.payload_length as usize * 8)
+            .div_ceil(header.bits_per_channel as usize);
+        channel_idx += header_channels + payload_channels;
+        if channel_idx >= total {
+            break;
+        }
+    }
+    channel_idx
 }
 
 impl StegoEncoder {
@@ -195,6 +225,103 @@ impl StegoEncoder {
 
         Ok(result_images)
     }
+
+    /// Encodes multiple independent messages into `cover_images`, packing them
+    /// back-to-back. When an image is full, overflow continues into the next image.
+    ///
+    /// Returns the modified images (every image that was written to at least once).
+    /// Returns [`StegoError::InsufficientCapacity`] if no image has room for a message.
+    pub fn encode_many(
+        self,
+        mut cover_images: Vec<RgbImage>,
+        messages: &[&[u8]],
+        password: &[u8],
+    ) -> Result<Vec<RgbImage>> {
+        if cover_images.is_empty() {
+            return Err(StegoError::InvalidConfig("no cover images provided".into()));
+        }
+        if cover_images.len() > 255 {
+            return Err(StegoError::InvalidConfig(
+                "too many cover images (max 255)".into(),
+            ));
+        }
+
+        let bpc = self.bits_per_channel;
+        let mut modified: Vec<bool> = vec![false; cover_images.len()];
+
+        for message in messages {
+            // Each message is encoded as a single chunk (single-image per message for now).
+            // Find the first image with enough free space.
+            let message_id: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+            let payload_hash = crate::crypto::sha256(message);
+
+            let mut placed = false;
+
+            for (img_idx, img) in cover_images.iter_mut().enumerate() {
+                let start_channel = scan_used_channels(img);
+                let total_channels = img.width() as usize * img.height() as usize * 3;
+
+                // Compute available space from start_channel
+                let remaining_channels = total_channels.saturating_sub(start_channel);
+                let header_channels = CHUNK_HEADER_SIZE * 8; // bpc=1
+                if remaining_channels <= header_channels {
+                    continue;
+                }
+                let payload_channels = remaining_channels - header_channels;
+                let payload_bytes = payload_channels * bpc as usize / 8;
+                let plaintext_cap = payload_bytes.saturating_sub(16); // GCM tag
+
+                if message.len() > plaintext_cap {
+                    continue;
+                }
+
+                // Encode this message into this image at start_channel
+                let mut argon2_salt = [0u8; 16];
+                let mut aes_nonce = [0u8; 12];
+                rand::thread_rng().fill_bytes(&mut argon2_salt);
+                rand::thread_rng().fill_bytes(&mut aes_nonce);
+
+                let base_key = crate::crypto::derive_base_key(password, &argon2_salt)?;
+                let aes_key = crate::crypto::derive_message_key(&base_key, &message_id)?;
+
+                let ciphertext_len = message.len() + 16;
+                let header = ChunkHeader {
+                    message_id,
+                    chunk_index: 0,
+                    total_chunks: 1,
+                    payload_length: ciphertext_len as u64,
+                    argon2_salt,
+                    aes_nonce,
+                    payload_hash,
+                    bits_per_channel: bpc,
+                    reserved: 0,
+                };
+                let header_bytes = header.to_bytes();
+                let ciphertext = crate::crypto::encrypt(&aes_key, &aes_nonce, message, &header_bytes)?;
+
+                let mut writer = LsbWriter::new_at(img.clone(), start_channel);
+                writer.write_bits(&header_bytes, 1)?;
+                writer.write_bits(&ciphertext, bpc)?;
+                *img = writer.into_image();
+                modified[img_idx] = true;
+                placed = true;
+                break;
+            }
+
+            if !placed {
+                return Err(StegoError::InsufficientCapacity {
+                    needed: message.len(),
+                    available: 0,
+                });
+            }
+        }
+
+        Ok(cover_images
+            .into_iter()
+            .zip(modified.iter())
+            .filter_map(|(img, &m)| if m { Some(img) } else { None })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +385,68 @@ mod tests {
         let enc = StegoEncoder::builder().build().unwrap();
         let msg = vec![0u8; 1024 * 1024];
         let err = enc.encode(cover, &msg, b"pass").unwrap_err();
+        assert!(matches!(err, StegoError::InsufficientCapacity { .. }));
+    }
+
+    #[test]
+    fn scan_used_channels_empty_image_returns_zero() {
+        let img = blank(100, 100);
+        // Fresh image has no valid headers, scan returns 0
+        assert_eq!(scan_used_channels(&img), 0);
+    }
+
+    #[test]
+    fn scan_used_channels_after_one_encode() {
+        let cover = vec![blank(100, 100)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let stego = enc.encode(cover, b"hello", b"pass").unwrap();
+        let used = scan_used_channels(&stego[0]);
+        // Should be header_channels + payload_channels > 0
+        assert!(used > CHUNK_HEADER_SIZE * 8);
+    }
+
+    #[test]
+    fn scan_used_channels_zero_for_tiny_image() {
+        // Image too small to fit a header
+        let img = blank(1, 1); // 3 channels, header needs 704
+        assert_eq!(scan_used_channels(&img), 0);
+    }
+
+    #[test]
+    fn encode_many_two_messages_one_image() {
+        let cover = vec![blank(200, 200)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let msgs: &[&[u8]] = &[b"first message", b"second message"];
+        let result = enc.encode_many(cover, msgs, b"pass");
+        assert!(result.is_ok());
+        let imgs = result.unwrap();
+        assert_eq!(imgs.len(), 1);
+        // Verify two headers are packed
+        let used = scan_used_channels(&imgs[0]);
+        assert!(used > CHUNK_HEADER_SIZE * 8 * 2);
+    }
+
+    #[test]
+    fn encode_many_overflow_to_second_image() {
+        // 100x100 = 30000 channels at bpc=1; header = 704 channels (88*8);
+        // payload capacity = 29296 channels = 29296 bits / 8 = 3662 bytes - 16 GCM = 3646 plaintext
+        // A message of 3646 bytes fills image 0 completely; "second" must go to image 1.
+        let covers = vec![blank(100, 100), blank(100, 100)];
+        let enc = StegoEncoder::builder().build().unwrap();
+        let big_msg = vec![0u8; 3646]; // exactly fills first image
+        let small_msg = b"second";
+        let msgs: &[&[u8]] = &[&big_msg, small_msg];
+        let imgs = enc.encode_many(covers, msgs, b"pass").unwrap();
+        // Both images should be returned (both modified)
+        assert_eq!(imgs.len(), 2);
+    }
+
+    #[test]
+    fn encode_many_no_space_returns_error() {
+        let cover = vec![blank(10, 10)]; // too small
+        let enc = StegoEncoder::builder().build().unwrap();
+        let msgs: &[&[u8]] = &[b"hello"];
+        let err = enc.encode_many(cover, msgs, b"pass").unwrap_err();
         assert!(matches!(err, StegoError::InsufficientCapacity { .. }));
     }
 }

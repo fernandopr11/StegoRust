@@ -9,4 +9,4 @@ pub mod lsb;
 
 pub use capacity::image_capacity;
 pub use decoder::StegoDecoder;
-pub use encoder::StegoEncoder;
+pub use encoder::{scan_used_channels, StegoEncoder};
